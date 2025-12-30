@@ -96,6 +96,8 @@ pub(crate) struct ReflectStruct<'a> {
 pub(crate) struct ReflectEnum<'a> {
     meta: ReflectMeta<'a>,
     variants: Vec<EnumVariant<'a>>,
+    /// The repr type if the enum has a `#[repr(u8/u16/u32/u64/usize)]` attribute.
+    repr_uint: Option<Ident>,
 }
 
 /// Represents a field on a struct or tuple struct.
@@ -310,8 +312,13 @@ impl<'a> ReflectDerive<'a> {
             }
             Data::Enum(data) => {
                 let variants = Self::collect_enum_variants(&data.variants)?;
+                let repr_uint = Self::parse_repr_uint(&input.attrs);
 
-                let reflect_enum = ReflectEnum { meta, variants };
+                let reflect_enum = ReflectEnum {
+                    meta,
+                    variants,
+                    repr_uint,
+                };
                 Ok(Self::Enum(reflect_enum))
             }
             Data::Union(..) => Err(syn::Error::new(
@@ -425,6 +432,25 @@ impl<'a> ReflectDerive<'a> {
             .fold(ResultSifter::default(), ResultSifter::fold);
 
         sifter.finish()
+    }
+
+    /// Parses the `#[repr(...)]` attribute to find unsigned integer repr types.
+    /// Returns the repr type identifier if found (e.g., `u8`, `u16`, `u32`, `u64`, `usize`).
+    fn parse_repr_uint(attrs: &[syn::Attribute]) -> Option<Ident> {
+        for attr in attrs {
+            if attr.path().is_ident("repr") {
+                if let Meta::List(meta_list) = &attr.meta {
+                    // Parse the repr argument (e.g., `repr(u32)`)
+                    if let Ok(ident) = meta_list.parse_args::<Ident>() {
+                        let s = ident.to_string();
+                        if matches!(s.as_str(), "u8" | "u16" | "u32" | "u64" | "usize") {
+                            return Some(ident);
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 }
 
@@ -847,6 +873,45 @@ impl<'a> ReflectEnum<'a> {
         &self.variants
     }
 
+    /// Returns the repr uint type if this enum has one (e.g., `u8`, `u32`).
+    pub fn repr_uint(&self) -> Option<&Ident> {
+        self.repr_uint.as_ref()
+    }
+
+    /// Returns true if this enum can use table-based reflection.
+    ///
+    /// An enum is eligible for table-based reflection if:
+    /// 1. It has a `#[repr(u8/u16/u32/u64/usize)]` attribute
+    /// 2. All variants are unit variants (no fields)
+    /// 3. Discriminants are contiguous starting from 0 (implicit or explicit)
+    pub fn can_use_table_based_reflect(&self) -> bool {
+        // Must have a repr(uN) attribute
+        if self.repr_uint.is_none() {
+            return false;
+        }
+
+        // All variants must be unit variants
+        for variant in &self.variants {
+            if !matches!(variant.fields, EnumVariantFields::Unit) {
+                return false;
+            }
+            // This is just a test so I'm skipping ignored varaints
+            if variant.attrs.ignore.is_ignored() {
+                return false;
+            }
+        }
+
+        // Check that discriminants are contiguous starting from 0
+        // Again, since this is a test we would impl this in a real impl
+        for variant in &self.variants {
+            if variant.data.discriminant.is_some() {
+                return false;
+            }
+        }
+
+        true
+    }
+
     /// Get a collection of types which are exposed to the reflection API
     pub fn active_types(&self) -> IndexSet<Type> {
         // Collect into an `IndexSet` to eliminate duplicate types.
@@ -882,16 +947,36 @@ impl<'a> ReflectEnum<'a> {
     pub fn to_info_tokens(&self) -> proc_macro2::TokenStream {
         let bevy_reflect_path = self.meta().bevy_reflect_path();
 
-        let variants = self
-            .variants
-            .iter()
-            .map(|variant| variant.to_info_tokens(bevy_reflect_path));
+        // Use optimized path for unit-only enums with repr(uN)
+        let info = if self.can_use_table_based_reflect() {
+            // Generate: EnumInfo::new_unit_enum::<Self>(&["Variant1", "Variant2", ...])
+            // This avoids generating N VariantInfo::Unit(...) constructor calls
+            let variant_names: Vec<String> = self
+                .variants
+                .iter()
+                .map(|v| v.data.ident.to_string())
+                .collect();
 
-        let mut info = quote! {
-            #bevy_reflect_path::EnumInfo::new::<Self>(&[
-                #(#variants),*
-            ])
+            quote! {
+                #bevy_reflect_path::EnumInfo::new_unit_enum::<Self>(&[
+                    #(#variant_names),*
+                ])
+            }
+        } else {
+            // Standard path: generate VariantInfo for each variant
+            let variants = self
+                .variants
+                .iter()
+                .map(|variant| variant.to_info_tokens(bevy_reflect_path));
+
+            quote! {
+                #bevy_reflect_path::EnumInfo::new::<Self>(&[
+                    #(#variants),*
+                ])
+            }
         };
+
+        let mut info = info;
 
         let custom_attributes = self.meta.attrs.custom_attributes();
         if !custom_attributes.is_empty() {

@@ -185,6 +185,38 @@ impl EnumInfo {
         }
     }
 
+    /// Create a new [`EnumInfo`] for a unit-only enum from a static slice of variant names.
+    ///
+    /// This is an optimization that avoids generating N `VariantInfo` constructor calls
+    /// in the derive macro, significantly reducing code size for large unit-only enums.
+    ///
+    /// # Arguments
+    ///
+    /// * `variant_names`: Static slice of variant names in declaration order
+    pub fn new_unit_enum<TEnum: Enum + TypePath>(variant_names: &'static [&'static str]) -> Self {
+        let variant_indices = variant_names
+            .iter()
+            .enumerate()
+            .map(|(index, &name)| (name, index))
+            .collect::<HashMap<_, _>>();
+
+        let variants: Box<[VariantInfo]> = variant_names
+            .iter()
+            .map(|&name| VariantInfo::Unit(crate::UnitVariantInfo::new(name)))
+            .collect();
+
+        Self {
+            ty: Type::of::<TEnum>(),
+            generics: Generics::new(),
+            variants,
+            variant_names: variant_names.to_vec().into_boxed_slice(),
+            variant_indices,
+            custom_attributes: Arc::new(CustomAttributes::default()),
+            #[cfg(feature = "reflect_documentation")]
+            docs: None,
+        }
+    }
+
     /// Sets the docstring for this enum.
     #[cfg(feature = "reflect_documentation")]
     pub fn with_docs(self, docs: Option<&'static str>) -> Self {
@@ -254,6 +286,94 @@ impl EnumInfo {
     impl_custom_attribute_methods!(self.custom_attributes, "enum");
 
     impl_generic_info_methods!(generics);
+}
+
+/// A const-constructible container for unit-only enum info.
+///
+/// This is an optimization for enums where all variants are unit variants.
+/// Unlike [`EnumInfo`], this type can be constructed at compile-time using
+/// only static data, avoiding runtime allocations entirely.
+///
+/// This is part of the "facet approach" to reduce binary bloat from reflection.
+#[derive(Clone, Debug)]
+pub struct UnitEnumInfo {
+    ty: Type,
+    generics: Generics,
+    /// Static slice of variant names - no heap allocation
+    variant_names: &'static [&'static str],
+    #[cfg(feature = "reflect_documentation")]
+    docs: Option<&'static str>,
+}
+
+impl UnitEnumInfo {
+    /// Create a new [`UnitEnumInfo`] from a static slice of variant names.
+    ///
+    /// This is designed to be callable in a const context (once const traits stabilize),
+    /// using only static data.
+    pub fn new<TEnum: Enum + TypePath>(variant_names: &'static [&'static str]) -> Self {
+        Self {
+            ty: Type::of::<TEnum>(),
+            generics: Generics::new(),
+            variant_names,
+            #[cfg(feature = "reflect_documentation")]
+            docs: None,
+        }
+    }
+
+    /// Sets the docstring for this enum.
+    #[cfg(feature = "reflect_documentation")]
+    pub fn with_docs(self, docs: Option<&'static str>) -> Self {
+        Self { docs, ..self }
+    }
+
+    /// A slice containing the names of all variants in order.
+    pub fn variant_names(&self) -> &[&'static str] {
+        self.variant_names
+    }
+
+    /// Get the name of the variant at the given index.
+    pub fn variant_name_at(&self, index: usize) -> Option<&'static str> {
+        self.variant_names.get(index).copied()
+    }
+
+    /// Get the index of the variant with the given name.
+    pub fn index_of(&self, name: &str) -> Option<usize> {
+        // Linear search - for unit enums this is typically fast enough
+        // and avoids the need for a HashMap
+        self.variant_names.iter().position(|&n| n == name)
+    }
+
+    /// Checks if a variant with the given name exists within this enum.
+    pub fn contains_variant(&self, name: &str) -> bool {
+        self.variant_names.contains(&name)
+    }
+
+    /// The number of variants in this enum.
+    pub fn variant_len(&self) -> usize {
+        self.variant_names.len()
+    }
+
+    impl_type_methods!(ty);
+
+    /// The docstring of this enum, if any.
+    #[cfg(feature = "reflect_documentation")]
+    pub fn docs(&self) -> Option<&'static str> {
+        self.docs
+    }
+
+    impl_generic_info_methods!(generics);
+
+    /// Convert this to a full [`EnumInfo`] by constructing [`UnitVariantInfo`] for each variant.
+    ///
+    /// This is useful when you need to access the full [`VariantInfo`] API,
+    /// but note that this allocates.
+    pub fn to_enum_info<TEnum: Enum + TypePath>(&self) -> EnumInfo {
+        let variants: alloc::vec::Vec<VariantInfo> = self.variant_names
+            .iter()
+            .map(|&name| VariantInfo::Unit(crate::UnitVariantInfo::new(name)))
+            .collect();
+        EnumInfo::new::<TEnum>(&variants)
+    }
 }
 
 /// An iterator over the fields in the current enum variant.
